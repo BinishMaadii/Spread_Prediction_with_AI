@@ -16,3 +16,11 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 import lightgbm as lgb
 
+
+### Defining some parameters behind it ###
+
+ROW_PER_CITY = 250 
+
+LAG_WEEKS = [1,2,4] # I will try with [1,2,4,8]
+
+
