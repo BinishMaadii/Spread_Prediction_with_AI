@@ -30,4 +30,3 @@ Place the competition data files in a `data/` folder in the same directory as th
 │   ├── dengue_labels_train.csv
 │   └── dengue_features_test.csv
 ├── plots/                # Auto-generated visualization outputs
-└── submission.csv        # Auto-generated final competition submission
