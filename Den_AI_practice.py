@@ -452,6 +452,125 @@ print("\n  saved every fold's scores -> cv_results_by_fold.csv")
 
 
 
+# =====================================================================
+# STEP 4: Compare BEFORE vs AFTER
+# =====================================================================
+print("\n=== STEP 4: Before vs. after ===")
+ 
+best_model = {}  # (city, setup_name) -> name of the best real model
+for city in CITIES:
+    for setup_name in ["before", "after"]:
+        rows = results_df[(results_df["city"] == city) &
+                          (results_df["setup"] == setup_name) &
+                          (results_df["model"].isin(REAL_MODELS))]
+        mean_mae = rows.groupby("model")["mae"].mean()
+        best_model[(city, setup_name)] = mean_mae.idxmin()
+ 
+experiment_rows = []
+for city in CITIES:
+    city_results = results_df[results_df["city"] == city]
+ 
+    print(f"\n{city.upper()}: average MAE over {N_FOLDS} validation years (lower is better)")
+    table = city_results.pivot_table(index="model", columns="setup", values="mae", aggfunc="mean")
+    table = table[["before", "after"]]
+    print(table.round(2).to_string())
+ 
+    for setup_name in ["before", "after"]:
+        winner = best_model[(city, setup_name)]
+        rows = city_results[(city_results["setup"] == setup_name) & (city_results["model"] == winner)]
+        baseline_rows = city_results[(city_results["setup"] == setup_name) &
+                                     (city_results["model"] == "seasonal_median")]
+        lgb_rows = city_results[(city_results["setup"] == setup_name) &
+                                (city_results["model"] == "lightgbm")]
+        setup = BEFORE if setup_name == "before" else AFTER
+        experiment_rows.append({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "city": city,
+            "setup": setup_name,
+            "rows_per_city": setup["rows_per_city"],
+            "fill_method": setup["fill_method"],
+            "lags": str(setup["lags"]),
+            "windows": str(setup["windows"]),
+            "best_model": winner,
+            "mae_mean": round(rows["mae"].mean(), 2),
+            "mae_std": round(rows["mae"].std(), 2),
+            "rmse": round(rows["rmse"].mean(), 2),
+            "mase": round(rows["mase"].mean(), 3),
+            "peak_mae": round(rows["peak_mae"].mean(), 2),
+            "baseline_mae": round(baseline_rows["mae"].mean(), 2),
+            "lgb_coverage_80": round(lgb_rows["coverage_80"].mean(), 2),
+        })
+ 
+    before = experiment_rows[-2]
+    after = experiment_rows[-1]
+    change = 100 * (after["mae_mean"] - before["mae_mean"]) / before["mae_mean"]
+    print(f"\n  BEFORE best model: {before['best_model']:14s} MAE = {before['mae_mean']:.2f} "
+          f"+/- {before['mae_std']:.2f}, MASE = {before['mase']:.3f}, peak MAE = {before['peak_mae']:.2f}")
+    print(f"  AFTER  best model: {after['best_model']:14s} MAE = {after['mae_mean']:.2f} "
+          f"+/- {after['mae_std']:.2f}, MASE = {after['mase']:.3f}, peak MAE = {after['peak_mae']:.2f}")
+    print(f"  Change in MAE: {change:+.1f}%   (seasonal-median baseline MAE = {after['baseline_mae']:.2f})")
+    print(f"  LightGBM 80% interval coverage: before {before['lgb_coverage_80']:.0%}, "
+          f"after {after['lgb_coverage_80']:.0%} (80% means well calibrated)")
+ 
+experiments = pd.DataFrame(experiment_rows)
+write_header = not os.path.exists("experiments.csv")
+experiments.to_csv("experiments.csv", mode="a", header=write_header, index=False)
+print("\n  appended summary -> experiments.csv")
+ 
+# --- Plot: MAE per model, before vs after ---
+model_order = ["seasonal_median", "last_value", "negbin_glm", "random_forest", "lightgbm", "ensemble"]
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for ax, city in zip(axes, CITIES):
+    city_results = results_df[results_df["city"] == city]
+    x = np.arange(len(model_order))
+    for i, setup_name in enumerate(["before", "after"]):
+        mean_mae = city_results[city_results["setup"] == setup_name].groupby("model")["mae"].mean()
+        values = [mean_mae.get(m, np.nan) for m in model_order]
+        ax.bar(x + i * 0.4, values, width=0.4, label=setup_name)
+    ax.set_xticks(x + 0.2)
+    ax.set_xticklabels(model_order, rotation=30)
+    ax.set_ylabel("average MAE over validation years")
+    ax.set_title(f"{city.upper()}: before vs. after")
+    ax.legend()
+fig.tight_layout()
+save_plot(fig, "before_vs_after_mae")
+ 
+# --- Plot: MAE of the best model in each validation year ---
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for ax, city in zip(axes, CITIES):
+    for setup_name in ["before", "after"]:
+        winner = best_model[(city, setup_name)]
+        rows = results_df[(results_df["city"] == city) & (results_df["setup"] == setup_name) &
+                          (results_df["model"] == winner)]
+        ax.plot(rows["fold"], rows["mae"], marker="o", label=f"{setup_name} ({winner})")
+    ax.set_xlabel("validation year (fold)")
+    ax.set_ylabel("MAE")
+    ax.set_title(f"{city.upper()}: MAE in each validation year")
+    ax.legend()
+fig.tight_layout()
+save_plot(fig, "mae_per_fold")
+ 
+# --- Plot: last validation year, actual vs. before vs. after ---
+for city in CITIES:
+    val_rows, before_preds = last_folds[("before", city)]
+    _, after_preds = last_folds[("after", city)]
+    before_winner = best_model[(city, "before")]
+    after_winner = best_model[(city, "after")]
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(val_rows["week_start_date"], val_rows["total_cases"], color="black", linewidth=2, label="actual")
+    ax.plot(val_rows["week_start_date"], before_preds[before_winner], linestyle="--",
+            label=f"before ({before_winner})")
+    ax.plot(val_rows["week_start_date"], after_preds[after_winner], linestyle="--",
+            label=f"after ({after_winner})")
+    ax.set_title(f"{city.upper()}: last validation year")
+    ax.legend()
+    fig.tight_layout()
+    save_plot(fig, f"{city}_last_year_before_vs_after")
+
+
+
+
+
 
 
 
