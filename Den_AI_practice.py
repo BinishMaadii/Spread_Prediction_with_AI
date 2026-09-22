@@ -669,6 +669,78 @@ print("Start with plots/..._before_vs_after_mae.png and experiments.csv.")
 
 
 
+# =====================================================================
+# STEP 6: Step-by-step improvement table (for your CV)
+# Each step keeps all the previous changes and adds ONE new change.
+# The difference between two rows is what that one change did.
+# =====================================================================
+print("\n=== STEP 6: Which change helped how much? ===")
+ 
+steps = []
+current = dict(BEFORE)
+steps.append(("original pipeline", dict(current)))
+ 
+current["rows_per_city"] = None
+steps.append(("use full training history", dict(current)))
+ 
+current["fill_method"] = "past_only"
+steps.append(("fill gaps with past values only (remove leakage)", dict(current)))
+ 
+current["lags"] = [1, 2, 3, 4, 8]
+current["windows"] = [4, 8]
+steps.append(("add more lag and rolling-average features", dict(current)))
+ 
+current["negbin_alpha"] = "tune"
+steps.append(("tune Negative Binomial alpha", dict(current)))
+ 
+current["rf_trees"] = 400
+current["rf_depth"] = 8
+current["lgb_rounds"] = 400
+current["lgb_leaves"] = 31
+current["lgb_learning_rate"] = 0.03
+steps.append(("tune Random Forest and LightGBM settings", dict(current)))
+ 
+current["use_ensemble"] = True
+steps.append(("average GLM and LightGBM (ensemble)", dict(current)))
+ 
+step_rows = []
+for step_number, (description, setup) in enumerate(steps):
+    setup["name"] = f"step{step_number}"
+    print(f"\n  Step {step_number}: {description}")
+    train_by_city, _ = prepare_data(setup)
+    for city in CITIES:
+        city_results, _ = walk_forward(train_by_city[city], setup)
+        real = city_results[city_results["model"].isin(REAL_MODELS)]
+        mean_mae = real.groupby("model")["mae"].mean()
+        winner = mean_mae.idxmin()
+        winner_rows = real[real["model"] == winner]
+        step_rows.append({
+            "step": step_number,
+            "change": description,
+            "city": city,
+            "best_model": winner,
+            "mae": round(winner_rows["mae"].mean(), 2),
+            "mase": round(winner_rows["mase"].mean(), 3),
+            "peak_mae": round(winner_rows["peak_mae"].mean(), 2),
+        })
+ 
+step_table = pd.DataFrame(step_rows)
+ 
+# How much each step changed MAE compared with the step before it,
+# and compared with the original pipeline
+step_table["mae_change_vs_previous_%"] = (
+    step_table.groupby("city")["mae"].pct_change() * 100).round(1)
+first_mae = step_table.groupby("city")["mae"].transform("first")
+step_table["mae_change_vs_original_%"] = ((step_table["mae"] - first_mae) / first_mae * 100).round(1)
+ 
+step_table.to_csv("improvement_steps.csv", index=False)
+for city in CITIES:
+    print(f"\n{city.upper()}:")
+    print(step_table[step_table["city"] == city].drop(columns="city").to_string(index=False))
+print("\n  saved -> improvement_steps.csv")
+ 
+
+
 
 
 
