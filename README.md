@@ -13,7 +13,7 @@ An end-to-end Python machine learning pipeline for the DrivenData **DengAI: Pred
    * **Random Forest Regressor:** Handles complex non-linear feature interactions.
    * **LightGBM Regressor:** Gradient boosting configured with a Poisson objective for skewed count distribution.
 4. **Validation:** Evaluates models on a held-out temporal validation set (the final 20% of training weeks) using Mean Absolute Error (MAE) and selects the best-performing model for each city independently.
-5. **Inference & Submission:** Refits winning models on the full dataset, generates predictions for the competition test set, clips negative values, and formats the final `submission.csv`.
+5. **Inference & Submission:** Refits winning models on the full dataset, generates predictions for the competition test set, clips negative values.
 
 ---
 
