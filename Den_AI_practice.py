@@ -572,6 +572,109 @@ for city in CITIES:
 
 
 
+# =====================================================================
+# STEP 5: Refit with the AFTER settings on all training data,
+# predict the test set, save model bundles + SHAP
+# =====================================================================
+print("\n=== STEP 5: Final models (AFTER settings) ===")
+train_by_city, test_by_city = data_by_setup["after"]
+submission_pieces = []
+model_manifest = {}
+ 
+for city in CITIES:
+    city_train = train_by_city[city]
+    city_test = test_by_city[city]
+    if AFTER["rows_per_city"] is not None:
+        city_train = city_train.iloc[-AFTER["rows_per_city"]:]
+ 
+    if AFTER["negbin_alpha"] == "tune":
+        alpha = tune_negbin_alpha(city_train)
+    else:
+        alpha = AFTER["negbin_alpha"]
+ 
+    fitted = {
+        "negbin_glm": fit_negbin(city_train, alpha),
+        "random_forest": fit_random_forest(city_train, AFTER),
+        "lightgbm": fit_lightgbm(city_train, AFTER),
+    }
+    test_preds = {
+        "negbin_glm": predict(fitted["negbin_glm"], city_test, is_glm=True),
+        "random_forest": predict(fitted["random_forest"], city_test),
+        "lightgbm": predict(fitted["lightgbm"], city_test),
+    }
+    if AFTER["use_ensemble"]:
+        test_preds["ensemble"] = (test_preds["negbin_glm"] + test_preds["lightgbm"]) / 2
+ 
+    winner = best_model[(city, "after")]
+    result = city_test[["city", "year", "weekofyear"]].copy()
+    result["total_cases"] = np.round(test_preds[winner]).astype(int)
+    submission_pieces.append(result)
+    print(f"  {city.upper()}: submission made with {winner} (negbin alpha = {alpha})")
+ 
+    # The FastAPI app loads ONE model object, so we save the best single model.
+    # If the ensemble won, this is the best of its parts.
+    after_rows = results_df[(results_df["city"] == city) & (results_df["setup"] == "after") &
+                            (results_df["model"].isin(SINGLE_MODELS))]
+    single_winner = after_rows.groupby("model")["mae"].mean().idxmin()
+ 
+    if single_winner == "negbin_glm":
+        model_kind = "glm"
+        feature_columns = GLM_COLUMNS
+    else:
+        model_kind = single_winner
+        feature_columns = list(get_X(city_train).columns)
+ 
+    bundle = {"model_kind": model_kind, "model": fitted[single_winner], "feature_columns": feature_columns}
+    bundle_path = os.path.join(MODELS_DIR, f"{city}_model.joblib")
+    joblib.dump(bundle, bundle_path)
+    print(f"  saved model bundle ({single_winner}) -> {bundle_path}")
+ 
+    winner_rows = after_rows[after_rows["model"] == single_winner]
+    model_manifest[city] = {
+        "model_kind": model_kind,
+        "bundle_path": bundle_path,
+        "n_features": len(feature_columns),
+        "cv_mae": round(winner_rows["mae"].mean(), 2),
+        "cv_mase": round(winner_rows["mase"].mean(), 3),
+        "submission_model": winner,
+        "negbin_alpha": alpha,
+    }
+ 
+    if single_winner in ("random_forest", "lightgbm"):
+        explainer = shap.TreeExplainer(fitted[single_winner])
+        sample = get_X(city_train).sample(min(100, len(city_train)), random_state=RANDOM_STATE)
+        shap_values = explainer.shap_values(sample)
+        plt.figure(figsize=(8, 6))
+        shap.summary_plot(shap_values, sample, show=False, plot_type="bar")
+        fig = plt.gcf()
+        fig.suptitle(f"{city.upper()}: SHAP feature importance ({single_winner})")
+        save_plot(fig, f"{city}_shap_summary")
+ 
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(city_test["week_start_date"], result["total_cases"].values, color="darkorange")
+    ax.set_title(f"{city.upper()}: forecast for the test period ({winner})")
+    ax.set_ylabel("predicted total_cases")
+    fig.tight_layout()
+    save_plot(fig, f"{city}_final_forecast")
+ 
+with open(os.path.join(MODELS_DIR, "manifest.json"), "w") as f:
+    json.dump(model_manifest, f, indent=2)
+print(f"  saved manifest -> {os.path.join(MODELS_DIR, 'manifest.json')}")
+ 
+submission = pd.concat(submission_pieces).reset_index(drop=True)
+submission.to_csv("submission.csv", index=False)
+print(f"\nFinal predictions saved to submission.csv ({len(submission)} rows).")
+print("Start with plots/..._before_vs_after_mae.png and experiments.csv.")
+
+
+
+
+
+
+
+
+
+
 
 
 
