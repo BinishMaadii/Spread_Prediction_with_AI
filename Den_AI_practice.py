@@ -113,3 +113,20 @@ def save_plot(fig, name):
  
 
 
+
+# =====================================================================
+# STEP 1: Load the raw data. This data is labeled
+# =====================================================================
+print("\n=== STEP 1: Loading data ===")
+features_train = pd.read_csv(os.path.join(DATA_DIR, "dengue_features_train.csv"),
+                             parse_dates=["week_start_date"])
+labels_train = pd.read_csv(os.path.join(DATA_DIR, "dengue_labels_train.csv"))
+features_test = pd.read_csv(os.path.join(DATA_DIR, "dengue_features_test.csv"),
+                            parse_dates=["week_start_date"])
+ 
+features_train = features_train.sort_values(["city", "week_start_date"]).reset_index(drop=True)
+features_test = features_test.sort_values(["city", "week_start_date"]).reset_index(drop=True)
+train_df = features_train.merge(labels_train, on=["city", "year", "weekofyear"], how="left")
+print("Training rows:", len(train_df), " Test rows:", len(features_test))
+ 
+
