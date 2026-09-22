@@ -130,3 +130,302 @@ train_df = features_train.merge(labels_train, on=["city", "year", "weekofyear"],
 print("Training rows:", len(train_df), " Test rows:", len(features_test))
  
 
+
+
+
+# =====================================================================
+# STEP 2: A few exploratory plots of the raw data
+# =====================================================================
+print("\n=== STEP 2: Exploring the raw data ===")
+ 
+fig, axes = plt.subplots(2, 1, figsize=(11, 6))
+for ax, city in zip(axes, CITIES):
+    city_data = train_df[train_df["city"] == city]
+    ax.plot(city_data["week_start_date"], city_data["total_cases"], color="crimson")
+    ax.set_title(f"Weekly dengue cases over time, {city.upper()}")
+    ax.set_ylabel("total_cases")
+fig.tight_layout()
+save_plot(fig, "cases_over_time")
+ 
+missing_counts = train_df[CLIMATE_COLUMNS].isna().sum()
+missing_counts = missing_counts[missing_counts > 0].sort_values()
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.barh(missing_counts.index, missing_counts.values, color="darkorange")
+ax.set_title("Missing values per column (training data)")
+fig.tight_layout()
+save_plot(fig, "missing_values")
+ 
+correlations = train_df[CLIMATE_COLUMNS + ["total_cases"]].corr()["total_cases"].drop("total_cases")
+correlations = correlations.sort_values()
+fig, ax = plt.subplots(figsize=(8, 6))
+colors = ["crimson" if v < 0 else "steelblue" for v in correlations.values]
+ax.barh(correlations.index, correlations.values, color=colors)
+ax.axvline(0, color="black", linewidth=0.8)
+ax.set_title("Correlation of each raw variable with total_cases")
+fig.tight_layout()
+save_plot(fig, "raw_correlation_with_cases")
+ 
+ 
+# =====================================================================
+# Data preparation functions (filling + feature engineering)
+# =====================================================================
+def fill_missing(all_data, method):
+    pieces = []
+    for city in CITIES:
+        city_rows = all_data[all_data["city"] == city].copy()
+        if method == "interpolate":
+            # Original method. It looks at the week AFTER a gap too,
+            # which you would not have yet in a real forecast.
+            city_rows[CLIMATE_COLUMNS] = city_rows[CLIMATE_COLUMNS].interpolate(
+                method="linear", limit_direction="both")
+        # "past_only": copy the last known value forward.
+        # The bfill only affects the first few rows of each city.
+        city_rows[CLIMATE_COLUMNS] = city_rows[CLIMATE_COLUMNS].ffill().bfill()
+        pieces.append(city_rows)
+    return pd.concat(pieces).reset_index(drop=True)
+ 
+ 
+def add_features(all_data, lags, windows):
+    pieces = []
+    for city in CITIES:
+        city_rows = all_data[all_data["city"] == city].copy()
+        city_rows = city_rows.sort_values("week_start_date").reset_index(drop=True)
+ 
+        city_rows["woy_sin"] = np.sin(2 * np.pi * city_rows["weekofyear"] / 52.0)
+        city_rows["woy_cos"] = np.cos(2 * np.pi * city_rows["weekofyear"] / 52.0)
+ 
+        for col in CLIMATE_COLUMNS:
+            for lag in lags:
+                city_rows[f"{col}_lag{lag}"] = city_rows[col].shift(lag)
+            for window in windows:
+                city_rows[f"{col}_avg{window}wk"] = (
+                    city_rows[col].shift(1).rolling(window=window, min_periods=1).mean()
+                )
+ 
+        # The first weeks of each city have no history for the lags yet
+        feature_cols = [c for c in city_rows.columns if c not in ID_COLUMNS]
+        city_rows[feature_cols] = city_rows[feature_cols].bfill().ffill()
+        pieces.append(city_rows)
+    return pd.concat(pieces).reset_index(drop=True)
+ 
+ 
+def prepare_data(setup):
+    """Returns two dicts: city -> training rows, city -> test rows."""
+    test_copy = features_test.copy()
+    test_copy["total_cases"] = np.nan
+    all_data = pd.concat([train_df, test_copy], ignore_index=True)
+    all_data = all_data.sort_values(["city", "week_start_date"]).reset_index(drop=True)
+ 
+    all_data = fill_missing(all_data, setup["fill_method"])
+    all_data = add_features(all_data, setup["lags"], setup["windows"])
+ 
+    train_by_city = {}
+    test_by_city = {}
+    for city in CITIES:
+        city_rows = all_data[all_data["city"] == city].reset_index(drop=True)
+        n_train = (train_df["city"] == city).sum()
+        city_train = city_rows.iloc[:n_train]
+        city_train = city_train[city_train["total_cases"].notna()].reset_index(drop=True)
+        train_by_city[city] = city_train
+        test_by_city[city] = city_rows.iloc[n_train:].reset_index(drop=True)
+    return train_by_city, test_by_city
+ 
+ 
+# =====================================================================
+# Model functions
+# =====================================================================
+def get_X(rows):
+    return rows.drop(columns=ID_COLUMNS)
+ 
+ 
+def fit_negbin(fit_rows, alpha):
+    formula = "total_cases ~ " + " + ".join(GLM_COLUMNS)
+    data = fit_rows[GLM_COLUMNS + ["total_cases"]]
+    family = sm.families.NegativeBinomial(alpha=alpha)
+    return smf.glm(formula=formula, data=data, family=family).fit()
+ 
+ 
+def fit_random_forest(fit_rows, setup):
+    model = RandomForestRegressor(
+        n_estimators=setup["rf_trees"],
+        max_depth=setup["rf_depth"],
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    model.fit(get_X(fit_rows), fit_rows["total_cases"])
+    return model
+ 
+ 
+def fit_lightgbm(fit_rows, setup, quantile=None):
+    # quantile=None -> normal Poisson model that predicts the expected count
+    # quantile=0.1  -> model that predicts the 10th percentile, and so on
+    if quantile is None:
+        model = lgb.LGBMRegressor(
+            objective="poisson",
+            n_estimators=setup["lgb_rounds"],
+            num_leaves=setup["lgb_leaves"],
+            learning_rate=setup["lgb_learning_rate"],
+            random_state=RANDOM_STATE,
+            verbose=-1,
+        )
+    else:
+        model = lgb.LGBMRegressor(
+            objective="quantile",
+            alpha=quantile,
+            n_estimators=setup["lgb_rounds"],
+            num_leaves=setup["lgb_leaves"],
+            learning_rate=setup["lgb_learning_rate"],
+            random_state=RANDOM_STATE,
+            verbose=-1,
+        )
+    model.fit(get_X(fit_rows), fit_rows["total_cases"])
+    return model
+ 
+ 
+def predict(model, rows, is_glm=False):
+    if is_glm:
+        preds = model.predict(rows[GLM_COLUMNS])
+    else:
+        preds = model.predict(get_X(rows))
+    return np.clip(np.asarray(preds, dtype=float), 0, None)
+ 
+ 
+def predict_seasonal_median(fit_rows, val_rows):
+    # Baseline: "this week will look like the median of the same week in past years"
+    median_by_week = fit_rows.groupby("weekofyear")["total_cases"].median()
+    preds = val_rows["weekofyear"].map(median_by_week)
+    preds = preds.fillna(fit_rows["total_cases"].median())  # e.g. week 53
+    return preds.values.astype(float)
+ 
+ 
+def predict_last_value(fit_rows, val_rows):
+    # Baseline: "every future week will have the same count as the last known week"
+    return np.full(len(val_rows), float(fit_rows["total_cases"].iloc[-1]))
+ 
+ 
+def tune_negbin_alpha(fit_rows):
+    """Try every alpha on the LAST year of the training rows and keep the best.
+    Only training rows are used, so the validation year stays unseen."""
+    inner_fit = fit_rows.iloc[:-HORIZON]
+    inner_val = fit_rows.iloc[-HORIZON:]
+    best_alpha = 1.0
+    best_mae = float("inf")
+    for alpha in ALPHA_GRID:
+        try:
+            model = fit_negbin(inner_fit, alpha)
+            preds = predict(model, inner_val, is_glm=True)
+        except Exception:
+            continue
+        if not np.all(np.isfinite(preds)):
+            continue
+        mae = mean_absolute_error(inner_val["total_cases"], preds)
+        if mae < best_mae:
+            best_mae = mae
+            best_alpha = alpha
+    return best_alpha
+ 
+ 
+# =====================================================================
+# Metrics
+# =====================================================================
+def forecast_metrics(actual, predicted, history):
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    history = np.asarray(history, dtype=float)
+ 
+    mae = mean_absolute_error(actual, predicted)
+    rmse = np.sqrt(np.mean((actual - predicted) ** 2))
+ 
+    # MASE: our MAE divided by the MAE of a seasonal-naive forecast
+    # ("same week last year") on the training history.
+    # MASE below 1 means we beat the naive forecast.
+    season = 52 if len(history) > 52 else 1
+    naive_mae = np.mean(np.abs(history[season:] - history[:-season]))
+    mase = mae / naive_mae
+ 
+    # Peak-week MAE: error only on outbreak weeks
+    # (weeks above the 90th percentile of the training history)
+    peak_weeks = actual >= np.percentile(history, 90)
+    if peak_weeks.sum() > 0:
+        peak_mae = mean_absolute_error(actual[peak_weeks], predicted[peak_weeks])
+    else:
+        peak_mae = np.nan
+ 
+    return {"mae": mae, "rmse": rmse, "mase": mase, "peak_mae": peak_mae}
+ 
+ 
+def interval_coverage(fit_rows, val_rows, setup):
+    """80% prediction interval from two LightGBM quantile models.
+    Coverage = share of real weeks that fall inside the interval (target: 0.80)."""
+    low = predict(fit_lightgbm(fit_rows, setup, quantile=0.1), val_rows)
+    high = predict(fit_lightgbm(fit_rows, setup, quantile=0.9), val_rows)
+    actual = val_rows["total_cases"].values
+    inside = (actual >= low) & (actual <= high)
+    return inside.mean(), (high - low).mean()
+ 
+ 
+# =====================================================================
+# Walk-forward evaluation
+# =====================================================================
+def get_all_predictions(fit_rows, val_rows, setup):
+    alpha = setup["negbin_alpha"]
+    if alpha == "tune":
+        alpha = tune_negbin_alpha(fit_rows)
+ 
+    preds = {}
+    preds["seasonal_median"] = predict_seasonal_median(fit_rows, val_rows)
+    preds["last_value"] = predict_last_value(fit_rows, val_rows)
+    preds["negbin_glm"] = predict(fit_negbin(fit_rows, alpha), val_rows, is_glm=True)
+    preds["random_forest"] = predict(fit_random_forest(fit_rows, setup), val_rows)
+    preds["lightgbm"] = predict(fit_lightgbm(fit_rows, setup), val_rows)
+    if setup["use_ensemble"]:
+        preds["ensemble"] = (preds["negbin_glm"] + preds["lightgbm"]) / 2
+    return preds, alpha
+ 
+ 
+def walk_forward(city_train, setup):
+    results = []
+    last_fold = None
+    n = len(city_train)
+ 
+    for fold in range(N_FOLDS):
+        val_start = n - (N_FOLDS - fold) * HORIZON
+        fit_rows = city_train.iloc[:val_start]
+        if setup["rows_per_city"] is not None:
+            fit_rows = fit_rows.iloc[-setup["rows_per_city"]:]
+        val_rows = city_train.iloc[val_start:val_start + HORIZON]
+ 
+        preds, alpha = get_all_predictions(fit_rows, val_rows, setup)
+        coverage, width = interval_coverage(fit_rows, val_rows, setup)
+ 
+        for model_name in preds:
+            full_history = city_train.iloc[:val_start]["total_cases"]
+            metrics = forecast_metrics(val_rows["total_cases"], preds[model_name],
+                                       fit_rows["total_cases"])
+            metrics["setup"] = setup["name"]
+            metrics["fold"] = fold + 1
+            metrics["model"] = model_name
+            metrics["val_start"] = val_rows["week_start_date"].iloc[0].date()
+            if model_name == "lightgbm":
+                metrics["coverage_80"] = coverage
+                metrics["interval_width"] = width
+            else:
+                metrics["coverage_80"] = np.nan
+                metrics["interval_width"] = np.nan
+            results.append(metrics)
+ 
+        print(f"    fold {fold + 1}: validation year starts {val_rows['week_start_date'].iloc[0].date()}, "
+              f"trained on {len(fit_rows)} weeks, negbin alpha = {alpha}")
+        last_fold = (val_rows, preds)
+ 
+    return pd.DataFrame(results), last_fold
+
+
+
+
+
+
+
+
+
+
