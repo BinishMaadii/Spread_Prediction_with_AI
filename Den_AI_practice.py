@@ -426,6 +426,33 @@ def walk_forward(city_train, setup):
 
 
 
+# =====================================================================
+# STEP 3: Evaluate BEFORE and AFTER on the same validation years to see the impact of improvments
+# =====================================================================
+all_results = []
+last_folds = {}
+data_by_setup = {}
+ 
+for setup in [BEFORE, AFTER]:
+    print(f"\n=== STEP 3: Walk-forward evaluation, setup = {setup['name'].upper()} ===")
+    train_by_city, test_by_city = prepare_data(setup)
+    data_by_setup[setup["name"]] = (train_by_city, test_by_city)
+    for city in CITIES:
+        print(f"  {city.upper()}:")
+        city_results, last_fold = walk_forward(train_by_city[city], setup)
+        city_results["city"] = city
+        all_results.append(city_results)
+        last_folds[(setup["name"], city)] = last_fold
+ 
+results_df = pd.concat(all_results, ignore_index=True)
+results_df.to_csv("cv_results_by_fold.csv", index=False)
+print("\n  saved every fold's scores -> cv_results_by_fold.csv")
+
+
+
+
+
+
 
 
 
