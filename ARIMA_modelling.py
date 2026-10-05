@@ -127,3 +127,62 @@ results_df.to_csv("arima_results_by_fold.csv", index=False)
 print("\n  saved -> arima_results_by_fold.csv")
 
 
+
+
+# =====================================================================
+# STEP 3: Plot the last validation year of each city
+# =====================================================================
+print("\n=== STEP 3: Plots ===")
+fig, axes = plt.subplots(2, 1, figsize=(10, 7))
+for ax, city in zip(axes, CITIES):
+    week_dates, actual, predicted = last_fold[city]
+    ax.plot(week_dates, actual, color="black", linewidth=2, label="actual")
+    ax.plot(week_dates, predicted, color="steelblue", linestyle="--", label="ARIMA")
+    ax.set_title(f"{city.upper()}: ARIMA forecast, last validation year")
+    ax.set_ylabel("total_cases")
+    ax.legend()
+fig.tight_layout()
+fig.savefig(os.path.join(PLOTS_DIR, "arima_last_year.png"), dpi=120, bbox_inches="tight")
+plt.close(fig)
+print("  saved plot -> plots/arima_last_year.png")
+ 
+# =====================================================================
+# STEP 4: Compare with the ML models (and with SARIMA if it was already run)
+# =====================================================================
+print("\n=== STEP 4: Comparison ===")
+columns = ["city", "fold", "model", "mae", "rmse", "mase", "peak_mae"]
+frames = []
+ 
+if os.path.exists("cv_results_by_fold.csv"):
+    ml_results = pd.read_csv("cv_results_by_fold.csv")
+    ml_results = ml_results[ml_results["setup"] == "after"]
+    frames.append(ml_results[columns])
+else:
+    print("  cv_results_by_fold.csv not found, run the ML pipeline first to compare.")
+ 
+frames.append(results_df[columns])
+if os.path.exists("sarima_results_by_fold.csv"):
+    frames.append(pd.read_csv("sarima_results_by_fold.csv")[columns])
+ 
+compare = pd.concat(frames, ignore_index=True)
+summary = compare.groupby(["city", "model"])[["mae", "rmse", "mase", "peak_mae"]].mean()
+ 
+for city in CITIES:
+    print(f"\n{city.upper()}: average over {N_FOLDS} validation years (lower is better)")
+    print(summary.loc[city].sort_values("mae").round(2).to_string())
+ 
+summary.round(3).to_csv("model_comparison.csv")
+print("\n  saved -> model_comparison.csv")
+ 
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for ax, city in zip(axes, CITIES):
+    city_summary = summary.loc[city].sort_values("mae")
+    ax.bar(city_summary.index, city_summary["mae"], color="steelblue")
+    ax.set_title(f"{city.upper()}: average MAE over validation years")
+    ax.set_ylabel("MAE")
+    ax.tick_params(axis="x", rotation=40)
+fig.tight_layout()
+fig.savefig(os.path.join(PLOTS_DIR, "model_comparison.png"), dpi=120, bbox_inches="tight")
+plt.close(fig)
+print("  saved plot -> plots/model_comparison.png")
+
