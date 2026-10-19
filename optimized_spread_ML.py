@@ -453,4 +453,32 @@ for name, r in results.items():
     plt.tight_layout()
     plt.savefig(f"{OUT_DIR}/07_confusion_{name}.png", dpi=150)
     plt.close()
+
+
+
+# =============================================================================
+# 8. Summary
+# =============================================================================
+summary = {
+    "labeled_wafers": int(len(y)),
+    "n_train": int(len(y_train)), "n_val": int(len(y_val)), "n_test": int(len(y_test)),
+    "lots_shared_train_test": len(overlap),
+    "baseline_always_none_accuracy": round(float(majority_acc), 3),
+    "baseline_test_macro_f1": float(comparison.loc["baseline", "test_macro_f1"]),
+    "improved_test_macro_f1": float(comparison.loc["improved", "test_macro_f1"]),
+    "macro_f1_change": round(float(point_diff), 3),
+    "macro_f1_change_95ci": [round(float(d_lo), 3), round(float(d_hi), 3)],
+    "verdict": verdict,
+}
+with open(f"{OUT_DIR}/summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
+ 
+print("\n" + "=" * 78)
+print("FINAL SUMMARY")
+print("=" * 78)
+for k, v in summary.items():
+    print(f"{k:34s}: {v}")
+print(f"\nSaved models, figures and tables to: {OUT_DIR}/")
+print("This is one seed and one split. To check stability, change SEED at the top, "
+      "run again, and compare the macro_f1_change values.")
  
