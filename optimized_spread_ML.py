@@ -193,4 +193,152 @@ if (split_table["test"] < 10).any():
 y_train, y_val, y_test = y[idx_train], y[idx_val], y[idx_test]
 majority_acc = (y_test == CLASS_TO_IDX["none"]).mean()
 print(f"Baseline 'always predict none': accuracy={majority_acc:.3f}")
+
+
+# =============================================================================
+# 5. Model and helper functions
+# =============================================================================
+# The CNN is the same as version 1 on purpose, so that any change in score
+# comes from the data and training changes, not from a new architecture.
+# Only the number of input channels differs (1 or 3).
  
+ 
+class WaferCNN(nn.Module):
+    def __init__(self, in_channels, num_classes=K):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.AdaptiveAvgPool2d((3, 3)),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 3 * 3, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, num_classes),
+        )
+ 
+    def forward(self, x):
+        return self.classifier(self.features(x))
+ 
+ 
+def to_input(xb, three_channels):
+    # xb: uint8 tensor (N, H, W) with values 0, 1, 2
+    if three_channels:
+        return torch.stack([(xb == 0), (xb == 1), (xb == 2)], dim=1).float()
+    return (xb.float() / 2.0).unsqueeze(1)
+ 
+ 
+def augment(x):
+    # One random rotation (0/90/180/270) and one random flip per batch.
+    # Same transform for the whole batch keeps the code simple. With thousands
+    # of batches per epoch, every wafer still sees many different views.
+    k = np.random.randint(4)
+    x = torch.rot90(x, k, dims=(2, 3))
+    if np.random.rand() < 0.5:
+        x = torch.flip(x, dims=(3,))
+    return x
+ 
+ 
+def predict_probs(model, X_u8, cfg, tta):
+    # Returns softmax probabilities, shape (N, K).
+    model.eval()
+    views = [(k, f) for k in range(4) for f in (False, True)] if tta else [(0, False)]
+    out = []
+    with torch.no_grad():
+        for start in range(0, len(X_u8), 512):
+            xb = to_input(X_u8[start:start + 512].to(device), cfg["three_channels"])
+            p = 0
+            for k, f in views:
+                v = torch.rot90(xb, k, dims=(2, 3))
+                if f:
+                    v = torch.flip(v, dims=(3,))
+                p = p + model(v).softmax(dim=1)
+            out.append((p / len(views)).cpu().numpy())
+    return np.concatenate(out)
+ 
+ 
+def run_experiment(name, cfg):
+    print("\n" + "=" * 78)
+    print(f"TRAINING: {name}")
+    print("=" * 78)
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+ 
+    X_all = torch.from_numpy(image_cache[(cfg["img_size"], cfg["pad_to_square"])])
+    X_train, X_val, X_test = X_all[idx_train], X_all[idx_val], X_all[idx_test]
+    yt_train = torch.from_numpy(y_train)
+ 
+    # Class weights: (total / (K * count)) ** power. Power 1 = full inverse
+    # frequency, power 0.5 = square root (gentler).
+    counts = np.bincount(y_train, minlength=K).astype(np.float64)
+    weights = (counts.sum() / (K * counts)) ** cfg["weight_power"]
+    print("class weights:", {c: round(float(w), 2) for c, w in zip(CLASSES, weights)})
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32).to(device))
+ 
+    in_ch = 3 if cfg["three_channels"] else 1
+    model = WaferCNN(in_ch).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"trainable parameters: {n_params:,}")
+ 
+    if cfg["optimizer"] == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+                 if cfg["cosine_schedule"] else None)
+ 
+    history = {"train_loss": [], "val_macro_f1": []}
+    best_f1, best_epoch, best_state, bad_epochs = -1.0, 0, None, 0
+    t_start = time.time()
+ 
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        perm = torch.randperm(len(X_train))
+        total_loss = 0.0
+        for start in range(0, len(perm), cfg["batch_size"]):
+            idx = perm[start:start + cfg["batch_size"]]
+            xb = to_input(X_train[idx].to(device), cfg["three_channels"])
+            yb = yt_train[idx].to(device)
+            if cfg["augment"]:
+                xb = augment(xb)
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(idx)
+        if scheduler is not None:
+            scheduler.step()
+ 
+        # Validation never uses TTA, so epochs stay fast.
+        val_pred = predict_probs(model, X_val, cfg, tta=False).argmax(1)
+        val_f1 = f1_score(y_val, val_pred, average="macro", labels=range(K), zero_division=0)
+        history["train_loss"].append(total_loss / len(perm))
+        history["val_macro_f1"].append(val_f1)
+        print(f"epoch {epoch:3d}/{EPOCHS} train_loss={history['train_loss'][-1]:.4f} "
+              f"val_macroF1={val_f1:.3f}")
+ 
+        if val_f1 > best_f1:
+            best_f1, best_epoch, bad_epochs = val_f1, epoch, 0
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            bad_epochs += 1
+            if bad_epochs >= cfg["patience"]:
+                print(f"early stop: no improvement for {cfg['patience']} epochs")
+                break
+ 
+    train_seconds = time.time() - t_start
+    model.load_state_dict(best_state)
+    print(f"best val macro-F1 {best_f1:.3f} at epoch {best_epoch}, "
+          f"training time {train_seconds / 60:.1f} min")
+ 
+    # Test set: used once, after the checkpoint is chosen.
+    probs = predict_probs(model, X_test, cfg, tta=cfg["tta"])
+    pd.DataFrame(history).rename_axis("epoch").to_csv(f"{OUT_DIR}/02_history_{name}.csv")
+    torch.save(model.state_dict(), f"{OUT_DIR}/wafer_cnn_{name}.pt")
+    return dict(probs=probs, pred=probs.argmax(1), best_val_f1=best_f1, best_epoch=best_epoch,
+                train_minutes=train_seconds / 60, n_params=n_params, history=history)
+ 
+ 
+results = {name: run_experiment(name, cfg) for name, cfg in CONFIGS.items()}
+
