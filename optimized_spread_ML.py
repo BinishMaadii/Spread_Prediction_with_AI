@@ -342,3 +342,115 @@ def run_experiment(name, cfg):
  
 results = {name: run_experiment(name, cfg) for name, cfg in CONFIGS.items()}
 
+
+# =============================================================================
+# 6. Compare the two models on the test set
+# =============================================================================
+print("\n" + "=" * 78)
+print("6. TEST SET COMPARISON (same wafers, same lot-grouped split)")
+print("=" * 78)
+ 
+# Bootstrap: resample the test wafers with replacement N_BOOTSTRAP times and
+# recompute macro-F1 each time. The spread of those numbers is the confidence
+# interval. Both models use the SAME resamples, so the difference between them
+# also gets an interval (a paired bootstrap).
+# Cost: wafers from the same lot are resampled independently, so the intervals
+# are slightly too narrow. Treat them as a guide.
+rng = np.random.default_rng(SEED)
+boot_idx = rng.integers(0, len(y_test), size=(N_BOOTSTRAP, len(y_test)))
+ 
+ 
+def macro_f1(true, pred):
+    return f1_score(true, pred, average="macro", labels=range(K), zero_division=0)
+ 
+ 
+boot = {name: np.array([macro_f1(y_test[b], r["pred"][b]) for b in boot_idx])
+        for name, r in results.items()}
+ 
+rows = []
+for name, r in results.items():
+    rep = classification_report(y_test, r["pred"], labels=range(K), target_names=CLASSES,
+                                output_dict=True, zero_division=0)
+    lo, hi = np.percentile(boot[name], [2.5, 97.5])
+    rows.append({
+        "model": name,
+        "test_accuracy": round(rep["accuracy"], 3),
+        "test_macro_f1": round(rep["macro avg"]["f1-score"], 3),
+        "macro_f1_95ci": f"{lo:.3f} to {hi:.3f}",
+        "test_macro_recall": round(rep["macro avg"]["recall"], 3),
+        "test_weighted_f1": round(rep["weighted avg"]["f1-score"], 3),
+        "best_val_macro_f1": round(r["best_val_f1"], 3),
+        "best_epoch": r["best_epoch"],
+        "train_minutes": round(r["train_minutes"], 1),
+        "parameters": r["n_params"],
+    })
+    r["report"] = rep
+ 
+comparison = pd.DataFrame(rows).set_index("model")
+print(comparison.T)
+comparison.to_csv(f"{OUT_DIR}/03_comparison.csv")
+ 
+diff = boot["improved"] - boot["baseline"]
+d_lo, d_hi = np.percentile(diff, [2.5, 97.5])
+point_diff = comparison.loc["improved", "test_macro_f1"] - comparison.loc["baseline", "test_macro_f1"]
+print(f"\nMacro-F1 change (improved - baseline): {point_diff:+.3f}, 95% interval {d_lo:+.3f} to {d_hi:+.3f}")
+if d_lo > 0:
+    verdict = "BETTER (interval is entirely above 0)"
+elif d_hi < 0:
+    verdict = "WORSE (interval is entirely below 0)"
+else:
+    verdict = "INCONCLUSIVE (interval includes 0)"
+print("Verdict:", verdict)
+ 
+per_class = pd.DataFrame({name: [results[name]["report"][c]["f1-score"] for c in CLASSES]
+                          for name in results}, index=CLASSES)
+per_class["change"] = per_class["improved"] - per_class["baseline"]
+per_class["test_wafers"] = np.bincount(y_test, minlength=K)
+print("\nPer-class test F1:")
+print(per_class.round(3))
+per_class.to_csv(f"{OUT_DIR}/04_per_class_f1.csv")
+ 
+# =============================================================================
+# 7. Figures
+# =============================================================================
+fig, ax = plt.subplots(figsize=(10, 4))
+per_class[["baseline", "improved"]].plot(kind="bar", ax=ax)
+ax.set_ylim(0, 1)
+ax.set_ylabel("test F1")
+ax.set_title("Per-class test F1: baseline vs improved")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+plt.savefig(f"{OUT_DIR}/05_per_class_f1.png", dpi=150)
+plt.close()
+ 
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+for name, r in results.items():
+    axes[0].plot(r["history"]["train_loss"], label=name)
+    axes[1].plot(r["history"]["val_macro_f1"], label=name)
+axes[0].set_title("Training loss (not comparable across models: different weights)")
+axes[1].set_title("Validation macro-F1")
+for a in axes:
+    a.set_xlabel("epoch")
+    a.legend()
+plt.tight_layout()
+plt.savefig(f"{OUT_DIR}/06_training_curves.png", dpi=150)
+plt.close()
+ 
+for name, r in results.items():
+    cm = confusion_matrix(y_test, r["pred"], labels=range(K)).astype(float)
+    cm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(cm, cmap="Blues", vmin=0, vmax=1)
+    ax.set_xticks(range(K)); ax.set_xticklabels(CLASSES, rotation=45, ha="right")
+    ax.set_yticks(range(K)); ax.set_yticklabels(CLASSES)
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+    ax.set_title(f"Confusion matrix, normalized by true class ({name})")
+    for i in range(K):
+        for j in range(K):
+            ax.text(j, i, f"{cm[i, j]:.0%}", ha="center", va="center", fontsize=8,
+                    color="white" if cm[i, j] > 0.5 else "black")
+    fig.colorbar(im)
+    plt.tight_layout()
+    plt.savefig(f"{OUT_DIR}/07_confusion_{name}.png", dpi=150)
+    plt.close()
+ 
