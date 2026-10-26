@@ -1,0 +1,817 @@
+import os
+import json
+import hashlib
+import platform
+import subprocess
+import warnings
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import joblib
+import shap
+import sklearn
+import statsmodels
+import lightgbm as lgb
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+# statsmodels prints a lot of convergence warnings while we try different alphas
+warnings.filterwarnings("ignore")
+
+# =====================================================================
+# SETTINGS
+# =====================================================================
+# DATA_DIR can be overridden with an environment variable. The CI tests use this
+# to point the script at small synthetic files instead of the Kaggle data.
+DATA_DIR =  "data" #os.environ.get("DATA_DIR", "/kaggle/input/datasets/binishbatool/dengue-time-series")
+PLOTS_DIR = "plots"
+MODELS_DIR = "models"
+RANDOM_STATE = 42
+CITIES = ["sj", "iq"]
+
+# QUICK=1 is a smoke-test mode for CI. It uses tiny models and skips Step 6.
+# A normal run (no QUICK variable) behaves exactly like before.
+QUICK = os.environ.get("QUICK") == "1"
+
+# Walk-forward validation: 4 folds, each one year (52 weeks) long.
+# The last 4 years of each city's training data are used as validation years.
+N_FOLDS = 4
+HORIZON = 52
+
+# Values of the Negative Binomial alpha to try when tuning
+ALPHA_GRID = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
+
+# The original settings from dengai_beginner.py
+BEFORE = {
+    "name": "before",
+    "rows_per_city": 250,          # only the most recent 250 weeks are used for training
+    "fill_method": "interpolate",  # straight line between the weeks before AND after a gap
+    "lags": [1, 2, 4],
+    "windows": [4],
+    "negbin_alpha": 1.0,
+    "rf_trees": 150,
+    "rf_depth": 6,
+    "lgb_rounds": 200,
+    "lgb_leaves": 15,
+    "lgb_learning_rate": 0.05,
+    "use_ensemble": False,
+}
+
+AFTER = {
+    "name": "after",
+    "rows_per_city": None,         # None = use all available history
+    "fill_method": "past_only",    # copy the last known value forward
+    "lags": [1, 2, 3, 4, 8],
+    "windows": [4, 8],
+    "negbin_alpha": "tune",        # pick the best alpha from ALPHA_GRID
+    "rf_trees": 400,
+    "rf_depth": 8,
+    "lgb_rounds": 400,
+    "lgb_leaves": 31,
+    "lgb_learning_rate": 0.03,
+    "use_ensemble": True,
+}
+
+if QUICK:
+    N_FOLDS = 2
+    for s in (BEFORE, AFTER):
+        s["rf_trees"] = 20
+        s["lgb_rounds"] = 20
+
+ID_COLUMNS = ["city", "year", "weekofyear", "week_start_date", "total_cases"]
+
+CLIMATE_COLUMNS = [
+    "ndvi_ne", "ndvi_nw", "ndvi_se", "ndvi_sw",
+    "precipitation_amt_mm",
+    "reanalysis_air_temp_k", "reanalysis_avg_temp_k", "reanalysis_dew_point_temp_k",
+    "reanalysis_max_air_temp_k", "reanalysis_min_air_temp_k",
+    "reanalysis_precip_amt_kg_per_m2", "reanalysis_relative_humidity_percent",
+    "reanalysis_sat_precip_amt_mm", "reanalysis_specific_humidity_g_per_kg",
+    "reanalysis_tdtr_k",
+    "station_avg_temp_c", "station_diur_temp_rng_c",
+    "station_max_temp_c", "station_min_temp_c", "station_precip_mm",
+]
+
+# The GLM only uses these 4 columns (lag 2 and window 4 exist in both setups)
+GLM_COLUMNS = [
+    "reanalysis_specific_humidity_g_per_kg_lag2",
+    "station_avg_temp_c_lag2",
+    "reanalysis_specific_humidity_g_per_kg_avg4wk",
+    "station_avg_temp_c_avg4wk",
+]
+
+# Models we are allowed to pick as the final model (baselines are only yardsticks)
+REAL_MODELS = ["negbin_glm", "random_forest", "lightgbm", "ensemble"]
+SINGLE_MODELS = ["negbin_glm", "random_forest", "lightgbm"]
+
+os.makedirs(PLOTS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+plot_number = [0]
+
+
+def save_plot(fig, name):
+    plot_number[0] += 1
+    path = os.path.join(PLOTS_DIR, f"{plot_number[0]:02d}_{name}.png")
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    try:
+        display(fig)  # renders the plot in a notebook cell
+    except NameError:
+        plt.close(fig)  # plain script (for example in CI): no display(), free the memory
+    print(f"  saved plot -> {path}")
+
+
+# =====================================================================
+# VERSIONING HELPERS
+# Every run of Step 5 gets a version id built from the time and the git commit.
+# =====================================================================
+def get_git_commit():
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                      stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except Exception:
+        return "nogit"  # not inside a git repo, or git is not installed
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+GIT_COMMIT = get_git_commit()
+RUN_TIME = datetime.now(timezone.utc)
+VERSION = RUN_TIME.strftime("%Y%m%d-%H%M%S") + "-" + GIT_COMMIT
+
+
+# =====================================================================
+# STEP 1: Load the raw data. This data is labeled
+# =====================================================================
+print("\n=== STEP 1: Loading data ===")
+FEATURES_TRAIN_PATH = os.path.join(DATA_DIR, "dengue_features_train.csv")
+LABELS_TRAIN_PATH = os.path.join(DATA_DIR, "dengue_labels_train.csv")
+FEATURES_TEST_PATH = os.path.join(DATA_DIR, "dengue_features_test.csv")
+
+features_train = pd.read_csv(FEATURES_TRAIN_PATH, parse_dates=["week_start_date"])
+labels_train = pd.read_csv(LABELS_TRAIN_PATH)
+features_test = pd.read_csv(FEATURES_TEST_PATH, parse_dates=["week_start_date"])
+
+features_train = features_train.sort_values(["city", "week_start_date"]).reset_index(drop=True)
+features_test = features_test.sort_values(["city", "week_start_date"]).reset_index(drop=True)
+train_df = features_train.merge(labels_train, on=["city", "year", "weekofyear"], how="left")
+print("Training rows:", len(train_df), " Test rows:", len(features_test))
+
+
+# =====================================================================
+# STEP 2: A few exploratory plots of the raw data
+# =====================================================================
+print("\n=== STEP 2: Exploring the raw data ===")
+
+fig, axes = plt.subplots(2, 1, figsize=(11, 6))
+for ax, city in zip(axes, CITIES):
+    city_data = train_df[train_df["city"] == city]
+    ax.plot(city_data["week_start_date"], city_data["total_cases"], color="crimson")
+    ax.set_title(f"Weekly dengue cases over time, {city.upper()}")
+    ax.set_ylabel("total_cases")
+fig.tight_layout()
+save_plot(fig, "cases_over_time")
+
+missing_counts = train_df[CLIMATE_COLUMNS].isna().sum()
+missing_counts = missing_counts[missing_counts > 0].sort_values()
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.barh(missing_counts.index, missing_counts.values, color="darkorange")
+ax.set_title("Missing values per column (training data)")
+fig.tight_layout()
+save_plot(fig, "missing_values")
+
+correlations = train_df[CLIMATE_COLUMNS + ["total_cases"]].corr()["total_cases"].drop("total_cases")
+correlations = correlations.sort_values()
+fig, ax = plt.subplots(figsize=(8, 6))
+colors = ["crimson" if v < 0 else "steelblue" for v in correlations.values]
+ax.barh(correlations.index, correlations.values, color=colors)
+ax.axvline(0, color="black", linewidth=0.8)
+ax.set_title("Correlation of each raw variable with total_cases")
+fig.tight_layout()
+save_plot(fig, "raw_correlation_with_cases")
+
+
+# =====================================================================
+# Data preparation functions (filling + feature engineering)
+# =====================================================================
+def fill_missing(all_data, method):
+    pieces = []
+    for city in CITIES:
+        city_rows = all_data[all_data["city"] == city].copy()
+        if method == "interpolate":
+            # Original method. It looks at the week AFTER a gap too,
+            # which you would not have yet in a real forecast.
+            city_rows[CLIMATE_COLUMNS] = city_rows[CLIMATE_COLUMNS].interpolate(
+                method="linear", limit_direction="both")
+        # "past_only": copy the last known value forward.
+        # The bfill only affects the first few rows of each city.
+        city_rows[CLIMATE_COLUMNS] = city_rows[CLIMATE_COLUMNS].ffill().bfill()
+        pieces.append(city_rows)
+    return pd.concat(pieces).reset_index(drop=True)
+
+
+def add_features(all_data, lags, windows):
+    pieces = []
+    for city in CITIES:
+        city_rows = all_data[all_data["city"] == city].copy()
+        city_rows = city_rows.sort_values("week_start_date").reset_index(drop=True)
+
+        city_rows["woy_sin"] = np.sin(2 * np.pi * city_rows["weekofyear"] / 52.0)
+        city_rows["woy_cos"] = np.cos(2 * np.pi * city_rows["weekofyear"] / 52.0)
+
+        for col in CLIMATE_COLUMNS:
+            for lag in lags:
+                city_rows[f"{col}_lag{lag}"] = city_rows[col].shift(lag)
+            for window in windows:
+                city_rows[f"{col}_avg{window}wk"] = (
+                    city_rows[col].shift(1).rolling(window=window, min_periods=1).mean()
+                )
+
+        # The first weeks of each city have no history for the lags yet
+        feature_cols = [c for c in city_rows.columns if c not in ID_COLUMNS]
+        city_rows[feature_cols] = city_rows[feature_cols].bfill().ffill()
+        pieces.append(city_rows)
+    return pd.concat(pieces).reset_index(drop=True)
+
+
+def prepare_data(setup):
+    """Returns two dicts: city -> training rows, city -> test rows."""
+    test_copy = features_test.copy()
+    test_copy["total_cases"] = np.nan
+    all_data = pd.concat([train_df, test_copy], ignore_index=True)
+    all_data = all_data.sort_values(["city", "week_start_date"]).reset_index(drop=True)
+
+    all_data = fill_missing(all_data, setup["fill_method"])
+    all_data = add_features(all_data, setup["lags"], setup["windows"])
+
+    train_by_city = {}
+    test_by_city = {}
+    for city in CITIES:
+        city_rows = all_data[all_data["city"] == city].reset_index(drop=True)
+        n_train = (train_df["city"] == city).sum()
+        city_train = city_rows.iloc[:n_train]
+        city_train = city_train[city_train["total_cases"].notna()].reset_index(drop=True)
+        train_by_city[city] = city_train
+        test_by_city[city] = city_rows.iloc[n_train:].reset_index(drop=True)
+    return train_by_city, test_by_city
+
+
+# =====================================================================
+# Model functions
+# =====================================================================
+def get_X(rows):
+    return rows.drop(columns=ID_COLUMNS)
+
+
+def fit_negbin(fit_rows, alpha):
+    formula = "total_cases ~ " + " + ".join(GLM_COLUMNS)
+    data = fit_rows[GLM_COLUMNS + ["total_cases"]]
+    family = sm.families.NegativeBinomial(alpha=alpha)
+    return smf.glm(formula=formula, data=data, family=family).fit()
+
+
+def fit_random_forest(fit_rows, setup):
+    model = RandomForestRegressor(
+        n_estimators=setup["rf_trees"],
+        max_depth=setup["rf_depth"],
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    model.fit(get_X(fit_rows), fit_rows["total_cases"])
+    return model
+
+
+def fit_lightgbm(fit_rows, setup, quantile=None):
+    # quantile=None -> normal Poisson model that predicts the expected count
+    # quantile=0.1  -> model that predicts the 10th percentile, and so on
+    if quantile is None:
+        model = lgb.LGBMRegressor(
+            objective="poisson",
+            n_estimators=setup["lgb_rounds"],
+            num_leaves=setup["lgb_leaves"],
+            learning_rate=setup["lgb_learning_rate"],
+            random_state=RANDOM_STATE,
+            verbose=-1,
+        )
+    else:
+        model = lgb.LGBMRegressor(
+            objective="quantile",
+            alpha=quantile,
+            n_estimators=setup["lgb_rounds"],
+            num_leaves=setup["lgb_leaves"],
+            learning_rate=setup["lgb_learning_rate"],
+            random_state=RANDOM_STATE,
+            verbose=-1,
+        )
+    model.fit(get_X(fit_rows), fit_rows["total_cases"])
+    return model
+
+
+def predict(model, rows, is_glm=False):
+    if is_glm:
+        preds = model.predict(rows[GLM_COLUMNS])
+    else:
+        preds = model.predict(get_X(rows))
+    return np.clip(np.asarray(preds, dtype=float), 0, None)
+
+
+def predict_seasonal_median(fit_rows, val_rows):
+    # Baseline: "this week will look like the median of the same week in past years"
+    median_by_week = fit_rows.groupby("weekofyear")["total_cases"].median()
+    preds = val_rows["weekofyear"].map(median_by_week)
+    preds = preds.fillna(fit_rows["total_cases"].median())  # e.g. week 53
+    return preds.values.astype(float)
+
+
+def predict_last_value(fit_rows, val_rows):
+    # Baseline: "every future week will have the same count as the last known week"
+    return np.full(len(val_rows), float(fit_rows["total_cases"].iloc[-1]))
+
+
+def tune_negbin_alpha(fit_rows):
+    """Try every alpha on the LAST year of the training rows and keep the best.
+    Only training rows are used, so the validation year stays unseen."""
+    inner_fit = fit_rows.iloc[:-HORIZON]
+    inner_val = fit_rows.iloc[-HORIZON:]
+    best_alpha = 1.0
+    best_mae = float("inf")
+    for alpha in ALPHA_GRID:
+        try:
+            model = fit_negbin(inner_fit, alpha)
+            preds = predict(model, inner_val, is_glm=True)
+        except Exception:
+            continue
+        if not np.all(np.isfinite(preds)):
+            continue
+        mae = mean_absolute_error(inner_val["total_cases"], preds)
+        if mae < best_mae:
+            best_mae = mae
+            best_alpha = alpha
+    return best_alpha
+
+
+# =====================================================================
+# Metrics
+# =====================================================================
+def forecast_metrics(actual, predicted, history):
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    history = np.asarray(history, dtype=float)
+
+    mae = mean_absolute_error(actual, predicted)
+    rmse = np.sqrt(np.mean((actual - predicted) ** 2))
+
+    # MASE: our MAE divided by the MAE of a seasonal-naive forecast
+    # ("same week last year") on the training history.
+    # MASE below 1 means we beat the naive forecast.
+    season = 52 if len(history) > 52 else 1
+    naive_mae = np.mean(np.abs(history[season:] - history[:-season]))
+    mase = mae / naive_mae
+
+    # Peak-week MAE: error only on outbreak weeks
+    # (weeks above the 90th percentile of the training history)
+    peak_weeks = actual >= np.percentile(history, 90)
+    if peak_weeks.sum() > 0:
+        peak_mae = mean_absolute_error(actual[peak_weeks], predicted[peak_weeks])
+    else:
+        peak_mae = np.nan
+
+    return {"mae": mae, "rmse": rmse, "mase": mase, "peak_mae": peak_mae}
+
+
+def interval_coverage(fit_rows, val_rows, setup):
+    """80% prediction interval from two LightGBM quantile models.
+    Coverage = share of real weeks that fall inside the interval (target: 0.80)."""
+    low = predict(fit_lightgbm(fit_rows, setup, quantile=0.1), val_rows)
+    high = predict(fit_lightgbm(fit_rows, setup, quantile=0.9), val_rows)
+    actual = val_rows["total_cases"].values
+    inside = (actual >= low) & (actual <= high)
+    return inside.mean(), (high - low).mean()
+
+
+# =====================================================================
+# Walk-forward evaluation
+# =====================================================================
+def get_all_predictions(fit_rows, val_rows, setup):
+    alpha = setup["negbin_alpha"]
+    if alpha == "tune":
+        alpha = tune_negbin_alpha(fit_rows)
+
+    preds = {}
+    preds["seasonal_median"] = predict_seasonal_median(fit_rows, val_rows)
+    preds["last_value"] = predict_last_value(fit_rows, val_rows)
+    preds["negbin_glm"] = predict(fit_negbin(fit_rows, alpha), val_rows, is_glm=True)
+    preds["random_forest"] = predict(fit_random_forest(fit_rows, setup), val_rows)
+    preds["lightgbm"] = predict(fit_lightgbm(fit_rows, setup), val_rows)
+    if setup["use_ensemble"]:
+        preds["ensemble"] = (preds["negbin_glm"] + preds["lightgbm"]) / 2
+    return preds, alpha
+
+
+def walk_forward(city_train, setup):
+    results = []
+    last_fold = None
+    n = len(city_train)
+
+    for fold in range(N_FOLDS):
+        val_start = n - (N_FOLDS - fold) * HORIZON
+        fit_rows = city_train.iloc[:val_start]
+        if setup["rows_per_city"] is not None:
+            fit_rows = fit_rows.iloc[-setup["rows_per_city"]:]
+        val_rows = city_train.iloc[val_start:val_start + HORIZON]
+
+        preds, alpha = get_all_predictions(fit_rows, val_rows, setup)
+        coverage, width = interval_coverage(fit_rows, val_rows, setup)
+
+        for model_name in preds:
+            metrics = forecast_metrics(val_rows["total_cases"], preds[model_name],
+                                       fit_rows["total_cases"])
+            metrics["setup"] = setup["name"]
+            metrics["fold"] = fold + 1
+            metrics["model"] = model_name
+            metrics["val_start"] = val_rows["week_start_date"].iloc[0].date()
+            if model_name == "lightgbm":
+                metrics["coverage_80"] = coverage
+                metrics["interval_width"] = width
+            else:
+                metrics["coverage_80"] = np.nan
+                metrics["interval_width"] = np.nan
+            results.append(metrics)
+
+        print(f"    fold {fold + 1}: validation year starts {val_rows['week_start_date'].iloc[0].date()}, "
+              f"trained on {len(fit_rows)} weeks, negbin alpha = {alpha}")
+        last_fold = (val_rows, preds)
+
+    return pd.DataFrame(results), last_fold
+
+
+# =====================================================================
+# STEP 3: Evaluate BEFORE and AFTER on the same validation years to see the impact of improvements
+# =====================================================================
+all_results = []
+last_folds = {}
+data_by_setup = {}
+
+for setup in [BEFORE, AFTER]:
+    print(f"\n=== STEP 3: Walk-forward evaluation, setup = {setup['name'].upper()} ===")
+    train_by_city, test_by_city = prepare_data(setup)
+    data_by_setup[setup["name"]] = (train_by_city, test_by_city)
+    for city in CITIES:
+        print(f"  {city.upper()}:")
+        city_results, last_fold = walk_forward(train_by_city[city], setup)
+        city_results["city"] = city
+        all_results.append(city_results)
+        last_folds[(setup["name"], city)] = last_fold
+
+results_df = pd.concat(all_results, ignore_index=True)
+results_df.to_csv("cv_results_by_fold.csv", index=False)
+print("\n  saved every fold's scores -> cv_results_by_fold.csv")
+
+
+# =====================================================================
+# STEP 4: Compare BEFORE vs AFTER
+# =====================================================================
+print("\n=== STEP 4: Before vs. after ===")
+
+best_model = {}  # (city, setup_name) -> name of the best real model
+for city in CITIES:
+    for setup_name in ["before", "after"]:
+        rows = results_df[(results_df["city"] == city) &
+                          (results_df["setup"] == setup_name) &
+                          (results_df["model"].isin(REAL_MODELS))]
+        mean_mae = rows.groupby("model")["mae"].mean()
+        best_model[(city, setup_name)] = mean_mae.idxmin()
+
+experiment_rows = []
+for city in CITIES:
+    city_results = results_df[results_df["city"] == city]
+
+    print(f"\n{city.upper()}: average MAE over {N_FOLDS} validation years (lower is better)")
+    table = city_results.pivot_table(index="model", columns="setup", values="mae", aggfunc="mean")
+    table = table[["before", "after"]]
+    print(table.round(2).to_string())
+
+    for setup_name in ["before", "after"]:
+        winner = best_model[(city, setup_name)]
+        rows = city_results[(city_results["setup"] == setup_name) & (city_results["model"] == winner)]
+        baseline_rows = city_results[(city_results["setup"] == setup_name) &
+                                     (city_results["model"] == "seasonal_median")]
+        lgb_rows = city_results[(city_results["setup"] == setup_name) &
+                                (city_results["model"] == "lightgbm")]
+        setup = BEFORE if setup_name == "before" else AFTER
+        experiment_rows.append({
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "version": VERSION,  # links every row in experiments.csv to a model version
+            "city": city,
+            "setup": setup_name,
+            "rows_per_city": setup["rows_per_city"],
+            "fill_method": setup["fill_method"],
+            "lags": str(setup["lags"]),
+            "windows": str(setup["windows"]),
+            "best_model": winner,
+            "mae_mean": round(rows["mae"].mean(), 2),
+            "mae_std": round(rows["mae"].std(), 2),
+            "rmse": round(rows["rmse"].mean(), 2),
+            "mase": round(rows["mase"].mean(), 3),
+            "peak_mae": round(rows["peak_mae"].mean(), 2),
+            "baseline_mae": round(baseline_rows["mae"].mean(), 2),
+            "lgb_coverage_80": round(lgb_rows["coverage_80"].mean(), 2),
+        })
+
+    before = experiment_rows[-2]
+    after = experiment_rows[-1]
+    change = 100 * (after["mae_mean"] - before["mae_mean"]) / before["mae_mean"]
+    print(f"\n  BEFORE best model: {before['best_model']:14s} MAE = {before['mae_mean']:.2f} "
+          f"+/- {before['mae_std']:.2f}, MASE = {before['mase']:.3f}, peak MAE = {before['peak_mae']:.2f}")
+    print(f"  AFTER  best model: {after['best_model']:14s} MAE = {after['mae_mean']:.2f} "
+          f"+/- {after['mae_std']:.2f}, MASE = {after['mase']:.3f}, peak MAE = {after['peak_mae']:.2f}")
+    print(f"  Change in MAE: {change:+.1f}%   (seasonal-median baseline MAE = {after['baseline_mae']:.2f})")
+    print(f"  LightGBM 80% interval coverage: before {before['lgb_coverage_80']:.0%}, "
+          f"after {after['lgb_coverage_80']:.0%} (80% means well calibrated)")
+
+experiments = pd.DataFrame(experiment_rows)
+write_header = not os.path.exists("experiments.csv")
+experiments.to_csv("experiments.csv", mode="a", header=write_header, index=False)
+print("\n  appended summary -> experiments.csv")
+
+# --- Plot: MAE per model, before vs after ---
+model_order = ["seasonal_median", "last_value", "negbin_glm", "random_forest", "lightgbm", "ensemble"]
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for ax, city in zip(axes, CITIES):
+    city_results = results_df[results_df["city"] == city]
+    x = np.arange(len(model_order))
+    for i, setup_name in enumerate(["before", "after"]):
+        mean_mae = city_results[city_results["setup"] == setup_name].groupby("model")["mae"].mean()
+        values = [mean_mae.get(m, np.nan) for m in model_order]
+        ax.bar(x + i * 0.4, values, width=0.4, label=setup_name)
+    ax.set_xticks(x + 0.2)
+    ax.set_xticklabels(model_order, rotation=30)
+    ax.set_ylabel("average MAE over validation years")
+    ax.set_title(f"{city.upper()}: before vs. after")
+    ax.legend()
+fig.tight_layout()
+save_plot(fig, "before_vs_after_mae")
+
+# --- Plot: MAE of the best model in each validation year ---
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for ax, city in zip(axes, CITIES):
+    for setup_name in ["before", "after"]:
+        winner = best_model[(city, setup_name)]
+        rows = results_df[(results_df["city"] == city) & (results_df["setup"] == setup_name) &
+                          (results_df["model"] == winner)]
+        ax.plot(rows["fold"], rows["mae"], marker="o", label=f"{setup_name} ({winner})")
+    ax.set_xlabel("validation year (fold)")
+    ax.set_ylabel("MAE")
+    ax.set_title(f"{city.upper()}: MAE in each validation year")
+    ax.legend()
+fig.tight_layout()
+save_plot(fig, "mae_per_fold")
+
+# --- Plot: last validation year, actual vs. before vs. after ---
+for city in CITIES:
+    val_rows, before_preds = last_folds[("before", city)]
+    _, after_preds = last_folds[("after", city)]
+    before_winner = best_model[(city, "before")]
+    after_winner = best_model[(city, "after")]
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(val_rows["week_start_date"], val_rows["total_cases"], color="black", linewidth=2, label="actual")
+    ax.plot(val_rows["week_start_date"], before_preds[before_winner], linestyle="--",
+            label=f"before ({before_winner})")
+    ax.plot(val_rows["week_start_date"], after_preds[after_winner], linestyle="--",
+            label=f"after ({after_winner})")
+    ax.set_title(f"{city.upper()}: last validation year")
+    ax.legend()
+    fig.tight_layout()
+    save_plot(fig, f"{city}_last_year_before_vs_after")
+
+
+# =====================================================================
+# STEP 5: Refit with the AFTER settings on all training data,
+# predict the test set, save VERSIONED model bundles + SHAP
+# =====================================================================
+print(f"\n=== STEP 5: Final models (AFTER settings), version {VERSION} ===")
+
+# Every run writes into its own folder, so older models are never overwritten.
+VERSION_DIR = os.path.join(MODELS_DIR, VERSION)
+os.makedirs(VERSION_DIR, exist_ok=True)
+
+train_by_city, test_by_city = data_by_setup["after"]
+submission_pieces = []
+model_manifest = {}
+
+for city in CITIES:
+    city_train = train_by_city[city]
+    city_test = test_by_city[city]
+    if AFTER["rows_per_city"] is not None:
+        city_train = city_train.iloc[-AFTER["rows_per_city"]:]
+
+    if AFTER["negbin_alpha"] == "tune":
+        alpha = tune_negbin_alpha(city_train)
+    else:
+        alpha = AFTER["negbin_alpha"]
+
+    fitted = {
+        "negbin_glm": fit_negbin(city_train, alpha),
+        "random_forest": fit_random_forest(city_train, AFTER),
+        "lightgbm": fit_lightgbm(city_train, AFTER),
+    }
+    test_preds = {
+        "negbin_glm": predict(fitted["negbin_glm"], city_test, is_glm=True),
+        "random_forest": predict(fitted["random_forest"], city_test),
+        "lightgbm": predict(fitted["lightgbm"], city_test),
+    }
+    if AFTER["use_ensemble"]:
+        test_preds["ensemble"] = (test_preds["negbin_glm"] + test_preds["lightgbm"]) / 2
+
+    winner = best_model[(city, "after")]
+    result = city_test[["city", "year", "weekofyear"]].copy()
+    result["total_cases"] = np.round(test_preds[winner]).astype(int)
+    submission_pieces.append(result)
+    print(f"  {city.upper()}: submission made with {winner} (negbin alpha = {alpha})")
+
+    # The FastAPI app loads ONE model object, so we save the best single model.
+    # If the ensemble won, this is the best of its parts.
+    after_rows = results_df[(results_df["city"] == city) & (results_df["setup"] == "after") &
+                            (results_df["model"].isin(SINGLE_MODELS))]
+    single_winner = after_rows.groupby("model")["mae"].mean().idxmin()
+
+    if single_winner == "negbin_glm":
+        model_kind = "glm"
+        feature_columns = GLM_COLUMNS
+    else:
+        model_kind = single_winner
+        feature_columns = list(get_X(city_train).columns)
+
+    bundle = {"model_kind": model_kind, "model": fitted[single_winner], "feature_columns": feature_columns}
+    bundle_path = os.path.join(VERSION_DIR, f"{city}_model.joblib")
+    joblib.dump(bundle, bundle_path)
+    print(f"  saved model bundle ({single_winner}) -> {bundle_path}")
+
+    winner_rows = after_rows[after_rows["model"] == single_winner]
+    model_manifest[city] = {
+        "model_kind": model_kind,
+        "bundle_path": bundle_path,
+        "n_features": len(feature_columns),
+        "cv_mae": round(winner_rows["mae"].mean(), 2),
+        "cv_mase": round(winner_rows["mase"].mean(), 3),
+        "submission_model": winner,
+        "negbin_alpha": alpha,
+    }
+
+    if single_winner in ("random_forest", "lightgbm"):
+        explainer = shap.TreeExplainer(fitted[single_winner])
+        sample = get_X(city_train).sample(min(100, len(city_train)), random_state=RANDOM_STATE)
+        shap_values = explainer.shap_values(sample)
+        plt.figure(figsize=(8, 6))
+        shap.summary_plot(shap_values, sample, show=False, plot_type="bar")
+        fig = plt.gcf()
+        fig.suptitle(f"{city.upper()}: SHAP feature importance ({single_winner})")
+        save_plot(fig, f"{city}_shap_summary")
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(city_test["week_start_date"], result["total_cases"].values, color="darkorange")
+    ax.set_title(f"{city.upper()}: forecast for the test period ({winner})")
+    ax.set_ylabel("predicted total_cases")
+    fig.tight_layout()
+    save_plot(fig, f"{city}_final_forecast")
+
+# The manifest records everything needed to trace or reproduce this model version.
+manifest = {
+    "version": VERSION,
+    "created_utc": RUN_TIME.isoformat(timespec="seconds"),
+    "git_commit": GIT_COMMIT,
+    "quick_mode": QUICK,
+    "data_sha256": {
+        "features_train": file_sha256(FEATURES_TRAIN_PATH),
+        "labels_train": file_sha256(LABELS_TRAIN_PATH),
+        "features_test": file_sha256(FEATURES_TEST_PATH),
+    },
+    "settings": AFTER,
+    "random_state": RANDOM_STATE,
+    "n_folds": N_FOLDS,
+    "library_versions": {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "scikit-learn": sklearn.__version__,
+        "statsmodels": statsmodels.__version__,
+        "lightgbm": lgb.__version__,
+        "shap": shap.__version__,
+    },
+    "cities": model_manifest,
+}
+manifest_path = os.path.join(VERSION_DIR, "manifest.json")
+with open(manifest_path, "w") as f:
+    json.dump(manifest, f, indent=2)
+print(f"  saved manifest -> {manifest_path}")
+
+# registry.json is a simple list of all versions. The last entry is the newest.
+registry_path = os.path.join(MODELS_DIR, "registry.json")
+if os.path.exists(registry_path):
+    with open(registry_path) as f:
+        registry = json.load(f)
+else:
+    registry = []
+registry.append({
+    "version": VERSION,
+    "created_utc": manifest["created_utc"],
+    "git_commit": GIT_COMMIT,
+    "cv_mae": {city: model_manifest[city]["cv_mae"] for city in CITIES},
+    "path": VERSION_DIR,
+})
+with open(registry_path, "w") as f:
+    json.dump(registry, f, indent=2)
+print(f"  registered version {VERSION} -> {registry_path} ({len(registry)} versions so far)")
+
+submission = pd.concat(submission_pieces).reset_index(drop=True)
+submission.to_csv("submission.csv", index=False)
+print(f"\nFinal predictions saved to submission.csv ({len(submission)} rows).")
+print("Start with plots/..._before_vs_after_mae.png and experiments.csv.")
+
+if QUICK:
+    print("\nQUICK mode: skipping Step 6.")
+    raise SystemExit(0)
+
+
+# =====================================================================
+# STEP 6: Step-by-step improvement table (for your CV)
+# Each step keeps all the previous changes and adds ONE new change.
+# The difference between two rows is what that one change did.
+# =====================================================================
+print("\n=== STEP 6: Which change helped how much? ===")
+
+steps = []
+current = dict(BEFORE)
+steps.append(("original pipeline", dict(current)))
+
+current["rows_per_city"] = None
+steps.append(("use full training history", dict(current)))
+
+current["fill_method"] = "past_only"
+steps.append(("fill gaps with past values only (remove leakage)", dict(current)))
+
+current["lags"] = [1, 2, 3, 4, 8]
+current["windows"] = [4, 8]
+steps.append(("add more lag and rolling-average features", dict(current)))
+
+current["negbin_alpha"] = "tune"
+steps.append(("tune Negative Binomial alpha", dict(current)))
+
+current["rf_trees"] = 400
+current["rf_depth"] = 8
+current["lgb_rounds"] = 400
+current["lgb_leaves"] = 31
+current["lgb_learning_rate"] = 0.03
+steps.append(("tune Random Forest and LightGBM settings", dict(current)))
+
+current["use_ensemble"] = True
+steps.append(("average GLM and LightGBM (ensemble)", dict(current)))
+
+step_rows = []
+for step_number, (description, setup) in enumerate(steps):
+    setup["name"] = f"step{step_number}"
+    print(f"\n  Step {step_number}: {description}")
+    train_by_city, _ = prepare_data(setup)
+    for city in CITIES:
+        city_results, _ = walk_forward(train_by_city[city], setup)
+        real = city_results[city_results["model"].isin(REAL_MODELS)]
+        mean_mae = real.groupby("model")["mae"].mean()
+        winner = mean_mae.idxmin()
+        winner_rows = real[real["model"] == winner]
+        step_rows.append({
+            "step": step_number,
+            "change": description,
+            "city": city,
+            "best_model": winner,
+            "mae": round(winner_rows["mae"].mean(), 2),
+            "mase": round(winner_rows["mase"].mean(), 3),
+            "peak_mae": round(winner_rows["peak_mae"].mean(), 2),
+        })
+
+step_table = pd.DataFrame(step_rows)
+
+# How much each step changed MAE compared with the step before it,
+# and compared with the original pipeline
+step_table["mae_change_vs_previous_%"] = (
+    step_table.groupby("city")["mae"].pct_change() * 100).round(1)
+first_mae = step_table.groupby("city")["mae"].transform("first")
+step_table["mae_change_vs_original_%"] = ((step_table["mae"] - first_mae) / first_mae * 100).round(1)
+
+step_table.to_csv("improvement_steps.csv", index=False)
+for city in CITIES:
+    print(f"\n{city.upper()}:")
+    print(step_table[step_table["city"] == city].drop(columns="city").to_string(index=False))
+print("\n  saved -> improvement_steps.csv")
